@@ -12,19 +12,24 @@
   Grbl is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+  GNU General Public License for more programmed.
 
   You should have received a copy of the GNU General Public License
   along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
 
 */
 
-#include "grbl/hal.h"
+#include "embroidery.h"
+
+#if EMBROIDERY_ENABLE
+
+#if !SDCARD_ENABLE
+#error "Embroidery plugin requires SD card plugin enabled!"
+#endif
+
 #include "grbl/motion_control.h"
 #include "grbl/protocol.h"
 #include "grbl/nvs_buffer.h"
-
-#include "embroidery.h"
 
 #define STITCH_QUEUE_SIZE 8 // must be a power of 2
 
@@ -37,6 +42,8 @@ typedef struct {
     uint8_t port;
     bool sync_mode;
     uint16_t stop_delay;
+    uint8_t edge;
+    bool debug;
 } embroidery_settings_t;
 
 typedef struct {
@@ -44,6 +51,14 @@ typedef struct {
     volatile uint_fast8_t tail;
     stitch_t stitch[STITCH_QUEUE_SIZE];
 } stitch_queue_t;
+
+typedef struct {
+    uint32_t jumps;
+    uint32_t stitches;
+    uint32_t trims;
+    uint32_t thread_changes;
+    uint32_t sequin_ejects;
+} embroidery_job_details_t;
 
 typedef struct {
     bool enqueued;
@@ -55,14 +70,16 @@ typedef struct {
     uint32_t trigger_interval;
     uint32_t last_trigger;
     uint32_t stitch_interval;
-    uint32_t errs, stitches, queued, exced;
+    embroidery_job_details_t programmed;
+    embroidery_job_details_t executed;
+    uint32_t errs, exced;
     uint32_t spindle_stop;
     spindle_state_t spindle;
-    sys_state_t machine_state;
+    volatile sys_state_t machine_state;
     vfs_file_t *file;
     plan_line_data_t plan_data;
     coord_data_t position;
-    uint8_t color;
+    embroidery_thread_color_t color;
     stitch_queue_t queue;
 } embroidery_job_t;
 
@@ -83,7 +100,6 @@ static embroidery_job_t job = {0};
 static void end_job (void)
 {
     job.completed = job.enqueued = true;
-    job.queue.head = job.queue.tail = 0;
 
     if(active_stream.type != StreamType_Null) {
         memcpy(&hal.stream, &active_stream, sizeof(io_stream_t));
@@ -101,9 +117,10 @@ static void end_job (void)
     }
 }
 
-static void thread_change (sys_state_t state)
+// Start a tool change sequence. Called by gcode.c on a M6 command (via HAL).
+static void thread_change (embroidery_thread_color_t color)
 {
-    const char *thread_color = api.get_thread_color(job.color);
+    const char *thread_color = api.get_thread_color(color);
 
     if(job.spindle.on) {
         job.spindle.on = Off;
@@ -114,9 +131,16 @@ static void thread_change (sys_state_t state)
     protocol_buffer_synchronize();              // Sync and finish all remaining buffered motions before moving on.
     system_set_exec_state_flag(EXEC_FEED_HOLD); // Use feed hold for program pause.
     protocol_execute_realtime();                // Execute suspend.
+
+    job.executed.thread_changes++;
 }
 
-static void thread_trim (sys_state_t state)
+static void exec_thread_change (sys_state_t state)
+{
+    api.thread_change(job.color);
+}
+
+static void thread_trim (void)
 {
     if(job.spindle.on) {
         job.spindle.on = Off;
@@ -127,35 +151,47 @@ static void thread_trim (sys_state_t state)
     protocol_buffer_synchronize();              // Sync and finish all remaining buffered motions before moving on.
     system_set_exec_state_flag(EXEC_FEED_HOLD); // Use feed hold for program pause.
     protocol_execute_realtime();                // Execute suspend.
+
+    job.executed.trims++;
+}
+
+static void exec_thread_trim (sys_state_t state)
+{
+    api.thread_trim();
 }
 
 static void onStateChanged (sys_state_t state)
 {
+    static uint32_t last_ms;
+
+    if(job.machine_state == state)
+        return;
+
     switch(state) {
 
         case STATE_IDLE:
-            if(job.stitching) {
-                if(job.first)
-                    job.first = false;
-                else {
-                    uint32_t ms = hal.get_elapsed_ticks() - job.last_trigger;
+            if(job.stitching && job.machine_state == STATE_CYCLE) {
+//                if(job.first)
+//                    job.first = false;
+ //               else {
+                    uint32_t ms = hal.get_elapsed_ticks() - last_ms; //job.last_trigger;
                     job.stitch_interval = max(job.stitch_interval, ms);
                 }
-            }
+//            }
             break;
 
         case STATE_CYCLE:
-//            last_ms = hal.get_elapsed_ticks();
+            last_ms = hal.get_elapsed_ticks();
             break;
-
     }
-
-    hal.port.digital_out(0, state == STATE_CYCLE);
 
     if(job.machine_state == STATE_HOLD)
         job.paused = false;
 
     job.machine_state = state;
+
+    if(embroidery.debug)
+        hal.port.digital_out(0, state == STATE_CYCLE);
 
     if(on_state_change)
         on_state_change(state);
@@ -165,9 +201,11 @@ static void needle_trigger (uint8_t port, bool state)
 {
     uint32_t ms = hal.get_elapsed_ticks();
 
-    if(job.await_trigger && ms - job.last_trigger > 15) {
+    if(job.await_trigger && ms - job.last_trigger > 25) {
 
-        job.trigger_interval = ms - job.last_trigger;
+        ms = ms - job.last_trigger;
+
+        job.trigger_interval = min(job.trigger_interval, ms);
 
         if(job.machine_state == STATE_CYCLE) {
             job.errs++;
@@ -177,7 +215,7 @@ static void needle_trigger (uint8_t port, bool state)
         job.await_trigger = false;
     }
 
-    job.stitches++;
+    job.executed.stitches++;
     job.last_trigger = ms;
 }
 
@@ -187,27 +225,27 @@ static void onExecuteRealtime (sys_state_t state)
 
     on_execute_realtime(state);
 
+    if(busy || job.completed)
+        return;
+
     if(job.spindle_stop && hal.get_elapsed_ticks() - job.last_trigger >= job.spindle_stop) {
         job.spindle.on = Off;
         job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
         job.spindle_stop = 0;
     }
 
-    if(busy || job.paused || job.await_trigger)
+    if(job.paused || job.await_trigger)
         return;
 
-    if(job.queue.tail == job.queue.head) {
+    if(job.enqueued && job.queue.tail == job.queue.head) {
 
-        if(job.enqueued && !job.completed) {
+        end_job();
+        hal.stream.cancel_read_buffer();
 
-            end_job();
-            hal.stream.cancel_read_buffer();
+        if(grbl.on_program_completed)
+            grbl.on_program_completed(ProgramFlow_CompletedM30, false);
 
-            if(grbl.on_program_completed)
-                grbl.on_program_completed(ProgramFlow_CompletedM30, false);
-
-            grbl.report.feedback_message(Message_ProgramEnd);
-        }
+        grbl.report.feedback_message(Message_ProgramEnd);
 
         return;
     }
@@ -264,6 +302,7 @@ static void onExecuteRealtime (sys_state_t state)
             break;
 
         case Stitch_Jump:
+            job.executed.jumps++;
             job.plan_data.condition.rapid_motion = On;
 
             job.position.x += stitch->target.x;
@@ -281,7 +320,7 @@ static void onExecuteRealtime (sys_state_t state)
             job.position.y += stitch->target.y;
             mc_line(job.position.values, &job.plan_data);
 
-            protocol_enqueue_rt_command(thread_trim);
+            protocol_enqueue_rt_command(exec_thread_trim);
             break;
 
         case Stitch_Stop:
@@ -293,7 +332,7 @@ static void onExecuteRealtime (sys_state_t state)
 //            mc_line(job.position.values, &job.plan_data);
 
             job.color = stitch->color;
-            protocol_enqueue_rt_command(thread_change);
+            protocol_enqueue_rt_command(exec_thread_change);
             job.spindle_stop = embroidery.stop_delay;
             break;
 
@@ -312,9 +351,32 @@ static int16_t sdcard_read (void)
         uint_fast8_t bptr = (job.queue.head + 1) & (STITCH_QUEUE_SIZE - 1);
 
         if(bptr != job.queue.tail) {
-            job.enqueued = !api.get_stitch(&job.queue.stitch[job.queue.head], job.file);
-            job.queue.head = bptr;
-            job.queued++;
+            if(!(job.enqueued = !api.get_stitch(&job.queue.stitch[job.queue.head], job.file))) {
+
+                switch(job.queue.stitch[job.queue.head].type) {
+                    case Stitch_Normal:
+                        job.programmed.stitches++;
+                        break;
+
+                    case Stitch_Jump:
+                        job.programmed.jumps++;
+                        break;
+
+                    case Stitch_Trim:
+                        job.programmed.trims++;
+                        break;
+
+                    case Stitch_Stop:
+                        job.programmed.thread_changes++;
+                        break;
+
+                    case Stitch_SequinEject:
+                        job.programmed.sequin_ejects++;
+                        break;
+                }
+
+                job.queue.head = bptr;
+            }
         }
     }
 
@@ -340,7 +402,7 @@ static spindle_data_t *spindleGetData (spindle_data_request_t request)
 
     if(request == SpindleData_RPM) {
         if(job.spindle.on)
-            spindle_data.rpm = 60.0f / (float)job.trigger_interval;
+            spindle_data.rpm = 60000.0f / (float)job.trigger_interval;
     }
 
     return &spindle_data;
@@ -362,15 +424,20 @@ static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool strea
             hal.stream.read = sdcard_read;                              // ...
 
             job.file = file;
-            job.completed = job.enqueued = job.await_trigger = job.paused = false;
+            job.completed = job.enqueued = job.await_trigger = job.paused = job.stitching = false;
             job.queue.head = job.queue.tail = job.stitch_interval = 0;
             job.plan_data.feed_rate = embroidery.feedrate;
             job.plan_data.condition.rapid_motion = On;
             job.plan_data.spindle.hal = gc_state.spindle.hal;
             job.plan_data.spindle.hal->get_data = spindleGetData;
+            job.plan_data.spindle.hal->cap.at_speed = On,
             system_convert_array_steps_to_mpos(job.position.values, sys.position);
 
-            job.errs = job.stitches = job.queued = job.exced = 0;
+            memset(&job.programmed, 0, sizeof(embroidery_job_details_t));
+            memset(&job.executed, 0, sizeof(embroidery_job_details_t));
+
+            job.trigger_interval = 10000;
+            job.errs = job.exced = 0;
 
         } else {
 
@@ -435,20 +502,42 @@ static void sdcard_reset (void)
     driver_reset();
 }
 
+static const setting_group_detail_t embroidery_groups [] = {
+    {Group_Root, Group_Embroidery, "Embroidery"}
+};
+
 static bool is_setting_available (const setting_detail_t *setting)
 {
-    return setting->id == Setting_UserDefined_2 && ioport_can_claim_explicit();
+    bool ok = false;
+
+    switch(setting->id) {
+
+        case Setting_UserDefined_2:
+            ok = ioport_can_claim_explicit();
+            break;
+
+        case Setting_UserDefined_6:
+            ok = hal.port.num_digital_out > 0;
+            break;
+
+        default:
+            break;
+    }
+
+    return ok;
 }
 
 static const setting_detail_t embroidery_settings[] = {
-    { Setting_UserDefined_0, Group_General, "Embroidery feedrate", "mm/min", Format_Decimal, "####0.0", NULL, NULL, Setting_NonCore, &embroidery.feedrate, NULL, NULL },
-    { Setting_UserDefined_1, Group_General, "Embroidery Z travel", "mm", Format_Decimal, "##0.0", NULL, NULL, Setting_NonCore, &embroidery.z_travel, NULL, NULL },
+    { Setting_UserDefined_0, Group_Embroidery, "Embroidery feedrate", "mm/min", Format_Decimal, "####0.0", NULL, NULL, Setting_NonCore, &embroidery.feedrate, NULL, NULL },
+    { Setting_UserDefined_1, Group_Embroidery, "Embroidery Z travel", "mm", Format_Decimal, "##0.0", NULL, NULL, Setting_NonCore, &embroidery.z_travel, NULL, NULL },
     { Setting_UserDefined_2, Group_AuxPorts, "Embroidery trigger port", NULL, Format_Int8, "#0", "0", max_port, Setting_NonCore, &embroidery.port, NULL, is_setting_available, { .reboot_required = On } },
-    { Setting_UserDefined_3, Group_General, "Sync mode", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.sync_mode, NULL, NULL },
-    { Setting_UserDefined_4, Group_General, "Stop delay", "milliseconds", Format_Int16, "##0", NULL, NULL, Setting_NonCore, &embroidery.stop_delay, NULL, NULL }
+    { Setting_UserDefined_3, Group_Embroidery, "Embroidery sync mode", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.sync_mode, NULL, NULL },
+    { Setting_UserDefined_4, Group_Embroidery, "Embroidery stop delay", "milliseconds", Format_Int16, "##0", NULL, NULL, Setting_NonCore, &embroidery.stop_delay, NULL, NULL },
+    { Setting_UserDefined_5, Group_Embroidery, "Trigger edge", NULL, Format_RadioButtons, "Falling,Rising", NULL, NULL, Setting_NonCore, &embroidery.edge, NULL, NULL, { .reboot_required = On } },
+    { Setting_UserDefined_6, Group_Embroidery, "Debug", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.debug, NULL, is_setting_available },
 };
 
-#ifndef NO_SETTINGS_DESCRIPTIONS
+#ifdef NO_SETTINGS_DESCRIPTIONS
 
 static const setting_descr_t embroidery_settings_descr[] = {
     { Setting_UserDefined_0, "Step jogging speed in millimeters per minute." },
@@ -468,6 +557,8 @@ static void embroidery_settings_restore (void)
     embroidery.feedrate = 4000.0f;
     embroidery.z_travel = 10.0f;
     embroidery.stop_delay = 0;
+    embroidery.edge = 0;
+    embroidery.debug = false;
 
     if(ioport_can_claim_explicit()) {
 
@@ -480,7 +571,7 @@ static void embroidery_settings_restore (void)
         if(port > 0) do {
             port--;
             if((portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port))) {
-                if(!portinfo->cap.claimed && (portinfo->cap.irq_mode & IRQ_Mode_Rising)) {
+                if(!portinfo->cap.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling))) {
                     embroidery.port = port;
                     break;
                 }
@@ -501,17 +592,22 @@ static void embroidery_settings_load (void)
     if(hal.nvs.memcpy_from_nvs((uint8_t *)&embroidery, nvs_address, sizeof(embroidery_settings_t), true) != NVS_TransferResult_OK)
         embroidery_settings_restore();
 
+    if(embroidery.debug)
+        embroidery.debug = hal.port.num_digital_out > 0;
+
     port = embroidery.port;
 
     xbar_t *portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port);
 
-    if(portinfo && !portinfo->cap.claimed && (portinfo->cap.irq_mode & IRQ_Mode_Rising) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
-        hal.port.register_interrupt_handler(port, IRQ_Mode_Rising, needle_trigger);
+    if(portinfo && !portinfo->cap.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
+        hal.port.register_interrupt_handler(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
     else
         protocol_enqueue_rt_command(warning_pin);
 }
 
 static setting_details_t setting_details = {
+    .groups = embroidery_groups,
+    .n_groups = sizeof(embroidery_groups) / sizeof(setting_group_detail_t),
     .settings = embroidery_settings,
     .n_settings = sizeof(embroidery_settings) / sizeof(setting_detail_t),
 #ifdef NO_SETTINGS_DESCRIPTIONS
@@ -531,6 +627,21 @@ static void onReportOptions (bool newopt)
         hal.stream.write("[PLUGIN:EMBROIDERY v0.01]" ASCII_EOL);
 }
 
+const char *embroidery_get_thread_color (embroidery_thread_color_t color)
+{
+    return api.get_thread_color ? api.get_thread_color(color) : NULL;
+}
+
+void embroidery_set_thread_trim_handler (thread_trim_ptr handler)
+{
+    api.thread_trim = handler;
+}
+
+void embroidery_set_thread_change_handler (thread_change_ptr handler)
+{
+    api.thread_change = handler;
+}
+
 void embroidery_init (void)
 {
     bool ok = false;
@@ -547,6 +658,7 @@ void embroidery_init (void)
 
     if(ok) {
 
+        job.completed = true;
         active_stream.type = StreamType_Null;
 
         settings_register(&setting_details);
@@ -566,6 +678,10 @@ void embroidery_init (void)
         on_execute_realtime = grbl.on_execute_realtime;
         grbl.on_execute_realtime = onExecuteRealtime;
 
+        api.thread_trim = thread_trim;
+        api.thread_change = thread_change;
     } else
         protocol_enqueue_rt_command(warning_pin);
 }
+
+#endif // EMBROIDERY_ENABLE

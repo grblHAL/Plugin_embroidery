@@ -20,8 +20,9 @@
   along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "grbl/hal.h"
 #include "embroidery.h"
+
+#if EMBROIDERY_ENABLE
 
 typedef struct {
     uint8_t b0;
@@ -31,7 +32,7 @@ typedef struct {
 
 static int32_t first_color = -1;
 
-static const char *get_thread_color (uint8_t color)
+static const char *get_thread_color (embroidery_thread_color_t color)
 {
     return "None";
 }
@@ -101,7 +102,7 @@ static bool get_stitch (stitch_t *stitch, vfs_file_t *file)
     if(first_color != -1) {
 
         stitch->type = Stitch_Stop;
-        stitch->color = (uint8_t)first_color;
+        stitch->color = (embroidery_thread_color_t)first_color;
         first_color = -1;
 
         return true;
@@ -197,3 +198,5 @@ bool tajima_open_file (vfs_file_t *file, embroidery_t *api)
 
     return ok;
 }
+
+#endif // EMBROIDERY_ENABLE

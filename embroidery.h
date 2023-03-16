@@ -22,6 +22,8 @@
 #ifndef _EMBROIDERY_H_
 #define _EMBROIDERY_H_
 
+#include "driver.h"
+
 typedef enum {
     Stitch_Normal,
     Stitch_Trim,
@@ -30,18 +32,24 @@ typedef enum {
     Stitch_SequinEject
 } stich_type_t;
 
+typedef uint8_t embroidery_thread_color_t;
+
 typedef struct {
     stich_type_t type;
-    uint8_t color;
+    embroidery_thread_color_t color;
     coord_data_t target;
 } stitch_t;
 
 typedef bool (*get_stitch_ptr)(stitch_t *stitch, vfs_file_t *file);
 typedef const char *(*get_thread_color_ptr)(uint8_t color);
+typedef void (*thread_trim_ptr)(void);
+typedef void (*thread_change_ptr)(embroidery_thread_color_t color);
 
 typedef struct {
     get_stitch_ptr get_stitch;
     get_thread_color_ptr get_thread_color;
+    thread_trim_ptr thread_trim;
+    thread_change_ptr thread_change;
     const char *name;
     uint32_t stitches;
     uint32_t threads;
@@ -53,5 +61,9 @@ typedef struct {
 } embroidery_t;
 
 typedef bool (*open_file_ptr)(vfs_file_t *file, embroidery_t *api);
+
+const char *embroidery_get_thread_color (embroidery_thread_color_t color);
+void embroidery_set_thread_trim_handler (thread_trim_ptr handler);
+void embroidery_set_thread_change_handler (thread_change_ptr handler);
 
 #endif // _EMBROIDERY_H_

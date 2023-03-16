@@ -21,8 +21,9 @@
   along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "grbl/hal.h"
 #include "embroidery.h"
+
+#if EMBROIDERY_ENABLE
 
 typedef union {
     uint8_t buf[12];
@@ -153,7 +154,7 @@ static pec_section2_t pec_2;
 static int32_t first_color = -1;
 static int32_t color_idx;
 
-static const char *get_thread_color (uint8_t color)
+static const char *get_thread_color (embroidery_thread_color_t color)
 {
     return palette_thread_list[color >= sizeof(palette_thread_list) / sizeof(struct pec_thread) ? 0 : color].name;
 }
@@ -167,7 +168,7 @@ static bool get_stitch (stitch_t *stitch, vfs_file_t *file)
     if(first_color != -1) {
 
         stitch->type = Stitch_Stop;
-        stitch->color = (uint8_t)first_color;
+        stitch->color = (embroidery_thread_color_t)first_color;
         stitch->target.x = stitch->target.y = 0.0f;
         first_color = -1;
 
@@ -189,7 +190,7 @@ static bool get_stitch (stitch_t *stitch, vfs_file_t *file)
                 vfs_read(&cmd, 1, 1, file);
                 vfs_read(&cmd, 1, 1, file);
                 color_idx++;
-                stitch->color = pec_1.palette_index[color_idx];
+                stitch->color = (embroidery_thread_color_t)pec_1.palette_index[color_idx];
                 stitch->target.x = stitch->target.y = 0.0f;
                 return true;
 
@@ -256,7 +257,7 @@ bool brother_open_file (vfs_file_t *file, embroidery_t *api)
 
         api->get_stitch = get_stitch;
         api->get_thread_color = get_thread_color;
-        first_color = pec_1.palette_index[0];
+        first_color = (embroidery_thread_color_t)pec_1.palette_index[0];
 
         ok = true;
     } else
@@ -264,3 +265,5 @@ bool brother_open_file (vfs_file_t *file, embroidery_t *api)
 
     return ok;
 }
+
+#endif // EMBROIDERY_ENABLE
