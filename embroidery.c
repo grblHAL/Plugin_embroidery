@@ -36,13 +36,19 @@
 extern bool brother_open_file (vfs_file_t *file, embroidery_t *api);
 extern bool tajima_open_file (vfs_file_t *file, embroidery_t *api);
 
+typedef enum {
+    EmbroideryTrig_Falling = 0,
+    EmbroideryTrig_Rising,
+    EmbroideryTrig_ZLimit
+} embroidery_trig_t;
+
 typedef struct {
     float feedrate;
     float z_travel;
     uint8_t port;
     bool sync_mode;
     uint16_t stop_delay;
-    uint8_t edge;
+    embroidery_trig_t edge;
     bool debug;
 } embroidery_settings_t;
 
@@ -67,7 +73,7 @@ typedef struct {
     bool stitching;
     bool first;
     volatile bool await_trigger;
-    uint32_t trigger_interval;
+    uint32_t trigger_interval, trigger_interval_min;
     uint32_t last_trigger;
     uint32_t stitch_interval;
     embroidery_job_details_t programmed;
@@ -95,6 +101,7 @@ static on_state_change_ptr on_state_change;
 static on_execute_realtime_ptr on_execute_realtime;
 static on_file_open_ptr on_file_open;
 static driver_reset_ptr driver_reset;
+static limit_interrupt_callback_ptr limits_interrupt_callback;
 static embroidery_job_t job = {0};
 
 static void end_job (void)
@@ -197,15 +204,14 @@ static void onStateChanged (sys_state_t state)
         on_state_change(state);
 }
 
-static void needle_trigger (uint8_t port, bool state)
+static inline void set_needle_trigger (void)
 {
     uint32_t ms = hal.get_elapsed_ticks();
 
-    if(job.await_trigger && ms - job.last_trigger > 25) {
+    if(job.await_trigger /*&& ms - job.last_trigger > 25*/) {
 
-        ms = ms - job.last_trigger;
-
-        job.trigger_interval = min(job.trigger_interval, ms);
+        job.trigger_interval = ms - job.last_trigger;
+        job.trigger_interval_min = min(job.trigger_interval_min, job.trigger_interval);
 
         if(job.machine_state == STATE_CYCLE) {
             job.errs++;
@@ -217,6 +223,22 @@ static void needle_trigger (uint8_t port, bool state)
 
     job.executed.stitches++;
     job.last_trigger = ms;
+}
+
+ISR_CODE void ISR_FUNC(z_limit_trigger)(limit_signals_t state)
+{
+    if(state.min.z) {
+        state.min.z = Off;
+        set_needle_trigger();
+    }
+
+    if(limit_signals_merge(state).value)
+        limits_interrupt_callback(state);
+}
+
+ISR_CODE static void ISR_FUNC(needle_trigger)(uint8_t port, bool state)
+{
+    set_needle_trigger();
 }
 
 static void onExecuteRealtime (sys_state_t state)
@@ -400,10 +422,8 @@ static spindle_data_t *spindleGetData (spindle_data_request_t request)
 {
     static spindle_data_t spindle_data = {0};
 
-    if(request == SpindleData_RPM) {
-        if(job.spindle.on)
-            spindle_data.rpm = 60000.0f / (float)job.trigger_interval;
-    }
+    if(request == SpindleData_RPM)
+        spindle_data.rpm = job.spindle.on ? 60000.0f / (float)job.trigger_interval : 0.0f;
 
     return &spindle_data;
 }
@@ -411,9 +431,6 @@ static spindle_data_t *spindleGetData (spindle_data_request_t request)
 static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool stream)
 {
     bool ok = false;
-
-//    stitch.trims = stitch.colors = 0;
-//    stitch.await_trigger = false;
 
     if(brother_open_file(file, &api) || tajima_open_file(file, &api)) {
 
@@ -425,7 +442,7 @@ static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool strea
 
             job.file = file;
             job.completed = job.enqueued = job.await_trigger = job.paused = job.stitching = false;
-            job.queue.head = job.queue.tail = job.stitch_interval = 0;
+            job.queue.head = job.queue.tail = job.stitch_interval = job.trigger_interval = 0;
             job.plan_data.feed_rate = embroidery.feedrate;
             job.plan_data.condition.rapid_motion = On;
             job.plan_data.spindle.hal = gc_state.spindle.hal;
@@ -436,7 +453,7 @@ static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool strea
             memset(&job.programmed, 0, sizeof(embroidery_job_details_t));
             memset(&job.executed, 0, sizeof(embroidery_job_details_t));
 
-            job.trigger_interval = 10000;
+            job.trigger_interval_min = 10000;
             job.errs = job.exced = 0;
 
         } else {
@@ -516,6 +533,10 @@ static bool is_setting_available (const setting_detail_t *setting)
             ok = ioport_can_claim_explicit();
             break;
 
+        case Setting_UserDefined_5:
+            ok = n_ports > 0;
+            break;
+
         case Setting_UserDefined_6:
             ok = hal.port.num_digital_out > 0;
             break;
@@ -533,7 +554,7 @@ static const setting_detail_t embroidery_settings[] = {
     { Setting_UserDefined_2, Group_AuxPorts, "Embroidery trigger port", NULL, Format_Int8, "#0", "0", max_port, Setting_NonCore, &embroidery.port, NULL, is_setting_available, { .reboot_required = On } },
     { Setting_UserDefined_3, Group_Embroidery, "Embroidery sync mode", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.sync_mode, NULL, NULL },
     { Setting_UserDefined_4, Group_Embroidery, "Embroidery stop delay", "milliseconds", Format_Int16, "##0", NULL, NULL, Setting_NonCore, &embroidery.stop_delay, NULL, NULL },
-    { Setting_UserDefined_5, Group_Embroidery, "Trigger edge", NULL, Format_RadioButtons, "Falling,Rising", NULL, NULL, Setting_NonCore, &embroidery.edge, NULL, NULL, { .reboot_required = On } },
+    { Setting_UserDefined_5, Group_Embroidery, "Trigger edge", NULL, Format_RadioButtons, "Falling,Rising,Z limit", NULL, NULL, Setting_NonCore, &embroidery.edge, NULL, NULL, { .reboot_required = On } },
     { Setting_UserDefined_6, Group_Embroidery, "Debug", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.debug, NULL, is_setting_available },
 };
 
@@ -554,18 +575,13 @@ static void embroidery_settings_save (void)
 
 static void embroidery_settings_restore (void)
 {
-    embroidery.feedrate = 4000.0f;
-    embroidery.z_travel = 10.0f;
-    embroidery.stop_delay = 0;
-    embroidery.edge = 0;
-    embroidery.debug = false;
-
-    if(ioport_can_claim_explicit()) {
+    if(ioport_can_claim_explicit() && (n_ports = ioports_available(Port_Digital, Port_Input))) {
 
         xbar_t *portinfo;
         uint8_t port = n_ports;
 
         embroidery.port = 0;
+        strcpy(max_port, uitoa(n_ports - 1));
 
         // Find highest numbered port that supports change interrupt.
         if(port > 0) do {
@@ -577,7 +593,14 @@ static void embroidery_settings_restore (void)
                 }
             }
         } while(port);
-    }
+    } else if((n_ports = hal.port.num_digital_in))
+        embroidery.port = --hal.port.num_digital_in;
+
+    embroidery.feedrate = 4000.0f;
+    embroidery.z_travel = 10.0f;
+    embroidery.stop_delay = 0;
+    embroidery.debug = false;
+    embroidery.edge = n_ports ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
 
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&embroidery, sizeof(embroidery_settings_t), true);
 }
@@ -585,6 +608,11 @@ static void embroidery_settings_restore (void)
 static void warning_pin (uint_fast16_t state)
 {
     report_message("Embroidery plugin failed to initialize, no pin for needle trigger signal!", Message_Warning);
+}
+
+static void warning_mem (uint_fast16_t state)
+{
+    report_message("Embroidery plugin failed to initialize, no NVS storage for settings!", Message_Warning);
 }
 
 static void embroidery_settings_load (void)
@@ -595,14 +623,26 @@ static void embroidery_settings_load (void)
     if(embroidery.debug)
         embroidery.debug = hal.port.num_digital_out > 0;
 
-    port = embroidery.port;
+    if(embroidery.edge == EmbroideryTrig_ZLimit) {
 
-    xbar_t *portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port);
+        hal.driver_cap.software_debounce = Off;
 
-    if(portinfo && !portinfo->cap.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
-        hal.port.register_interrupt_handler(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
-    else
-        protocol_enqueue_rt_command(warning_pin);
+        limits_interrupt_callback = hal.limits.interrupt_callback;
+        hal.limits.interrupt_callback = z_limit_trigger;
+
+        // ensure hard limits is enabled - interrupt will not fire if not
+
+    } else {
+
+        port = embroidery.port;
+
+        xbar_t *portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port);
+
+        if(portinfo && !portinfo->cap.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
+            hal.port.register_interrupt_handler(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
+        else
+            protocol_enqueue_rt_command(warning_pin);
+    }
 }
 
 static setting_details_t setting_details = {
@@ -624,7 +664,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:EMBROIDERY v0.01]" ASCII_EOL);
+        hal.stream.write("[PLUGIN:EMBROIDERY v0.02]" ASCII_EOL);
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
@@ -644,19 +684,7 @@ void embroidery_set_thread_change_handler (thread_change_ptr handler)
 
 void embroidery_init (void)
 {
-    bool ok = false;
-
-   if(!ioport_can_claim_explicit()) {
-
-        // Driver does not support explicit pin claiming, claim the highest numbered port instead.
-
-        if((ok = (n_ports = hal.port.num_digital_in) > 0 && (nvs_address = nvs_alloc(sizeof(embroidery_settings_t)))))
-            embroidery.port = --hal.port.num_digital_in;
-
-    } else if((ok = (n_ports = ioports_available(Port_Digital, Port_Input)) > 0 && (nvs_address = nvs_alloc(sizeof(embroidery_settings_t)))))
-        strcpy(max_port, uitoa(n_ports - 1));
-
-    if(ok) {
+    if((nvs_address = nvs_alloc(sizeof(embroidery_settings_t)))) {
 
         job.completed = true;
         active_stream.type = StreamType_Null;
@@ -681,7 +709,7 @@ void embroidery_init (void)
         api.thread_trim = thread_trim;
         api.thread_change = thread_change;
     } else
-        protocol_enqueue_rt_command(warning_pin);
+        protocol_enqueue_rt_command(warning_mem);
 }
 
 #endif // EMBROIDERY_ENABLE

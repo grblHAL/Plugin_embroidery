@@ -45,7 +45,7 @@ Driver and board with SD card plugin support and one interrupt capable auxillary
 
 #### Extensions:
 
-Plugin code can register handlers for thread trim and thread \(color\) changes. These can then be used to implement automatic operation. 
+Plugin code can register handlers for thread trim and thread \(color\) changes. These can then be used for implementing automatic operation. 
 
 #### Other options:
 
