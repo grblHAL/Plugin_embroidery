@@ -440,12 +440,13 @@ static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool strea
             hal.stream.type = StreamType_File;                          // then redirect to read from SD card instead
             hal.stream.read = sdcard_read;                              // ...
 
+            plan_data_init(&job.plan_data);
+
             job.file = file;
             job.completed = job.enqueued = job.await_trigger = job.paused = job.stitching = false;
             job.queue.head = job.queue.tail = job.stitch_interval = job.trigger_interval = 0;
             job.plan_data.feed_rate = embroidery.feedrate;
             job.plan_data.condition.rapid_motion = On;
-            job.plan_data.spindle.hal = gc_state.spindle.hal;
             job.plan_data.spindle.hal->get_data = spindleGetData;
             job.plan_data.spindle.hal->cap.at_speed = On,
             system_convert_array_steps_to_mpos(job.position.values, sys.position);
