@@ -167,6 +167,20 @@ static void exec_thread_trim (sys_state_t state)
     api.thread_trim();
 }
 
+static void exec_hold (sys_state_t state)
+{
+    if(job.spindle.on) {
+        job.spindle.on = Off;
+        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+    }
+
+    report_message("Jump", Message_Info);
+    protocol_buffer_synchronize();              // Sync and finish all remaining buffered motions before moving on.
+    system_set_exec_state_flag(EXEC_FEED_HOLD); // Use feed hold for program pause.
+    protocol_execute_realtime();                // Execute suspend.
+    mc_line(job.position.values, &job.plan_data);
+}
+
 static void onStateChanged (sys_state_t state)
 {
     static uint32_t last_ms;
@@ -281,6 +295,8 @@ static void onExecuteRealtime (sys_state_t state)
     if(!job.stitching && stitch->type == Stitch_Normal && job.machine_state != STATE_IDLE)
         return;
 
+    bool was_stitching = job.stitching;
+
     busy = true;
 
     job.queue.tail = ++job.queue.tail & (STITCH_QUEUE_SIZE - 1);
@@ -330,7 +346,11 @@ static void onExecuteRealtime (sys_state_t state)
             job.position.x += stitch->target.x;
             job.position.y += stitch->target.y;
 
-            mc_line(job.position.values, &job.plan_data);
+            if(was_stitching) {
+                job.paused = true;
+                protocol_enqueue_rt_command(exec_hold);
+            } else
+                mc_line(job.position.values, &job.plan_data);
             break;
 
         case Stitch_Trim:
@@ -665,7 +685,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:EMBROIDERY v0.02]" ASCII_EOL);
+        hal.stream.write("[PLUGIN:EMBROIDERY v0.03]" ASCII_EOL);
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
