@@ -120,7 +120,7 @@ static void end_job (void)
 
     if(job.spindle.on) {
         job.spindle.on = Off;
-        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+        job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 0.0f);
     }
 }
 
@@ -131,7 +131,7 @@ static void thread_change (embroidery_thread_color_t color)
 
     if(job.spindle.on) {
         job.spindle.on = Off;
-        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+        job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 0.0f);
     }
 
     report_message(thread_color, Message_Info);
@@ -151,7 +151,7 @@ static void thread_trim (void)
 {
     if(job.spindle.on) {
         job.spindle.on = Off;
-        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+        job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 0.0f);
     }
 
     report_message("trim", Message_Info);
@@ -171,7 +171,7 @@ static void exec_hold (sys_state_t state)
 {
     if(job.spindle.on) {
         job.spindle.on = Off;
-        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+        job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 0.0f);
     }
 
     report_message("Jump", Message_Info);
@@ -266,7 +266,7 @@ static void onExecuteRealtime (sys_state_t state)
 
     if(job.spindle_stop && hal.get_elapsed_ticks() - job.last_trigger >= job.spindle_stop) {
         job.spindle.on = Off;
-        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+        job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 0.0f);
         job.spindle_stop = 0;
     }
 
@@ -309,7 +309,7 @@ static void onExecuteRealtime (sys_state_t state)
 
     if(!(job.stitching = stitch->type == Stitch_Normal) && embroidery.stop_delay == 0) {
         job.spindle.on = Off;
-        job.plan_data.spindle.hal->set_state(job.spindle, 0.0f);
+        job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 0.0f);
         job.spindle_stop = 0;
     }
 
@@ -324,7 +324,7 @@ static void onExecuteRealtime (sys_state_t state)
 
             if((job.first = !job.spindle.on)) {
                 job.spindle.on = On;
-                job.plan_data.spindle.hal->set_state(job.spindle, 1.0f);
+                job.plan_data.spindle.hal->set_state(job.plan_data.spindle.hal, job.spindle, 1.0f);
             }
 
             mc_line(job.position.values, &job.plan_data);
@@ -685,7 +685,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:EMBROIDERY v0.03]" ASCII_EOL);
+        hal.stream.write("[PLUGIN:EMBROIDERY v0.04]" ASCII_EOL);
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
