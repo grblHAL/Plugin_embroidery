@@ -2,7 +2,7 @@
 
   embroidery.c - plugin for reading and executing embroidery files from SD card.
 
-  Copyright (c) 2023 Terje Io
+  Copyright (c) 2023-2024 Terje Io
 
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -147,7 +147,7 @@ static void thread_change (embroidery_thread_color_t color)
     job.executed.thread_changes++;
 }
 
-static void exec_thread_change (sys_state_t state)
+static void exec_thread_change (void *data)
 {
     api.thread_change(job.color);
 }
@@ -164,12 +164,12 @@ static void thread_trim (void)
     job.executed.trims++;
 }
 
-static void exec_thread_trim (sys_state_t state)
+static void exec_thread_trim (void *data)
 {
     api.thread_trim();
 }
 
-static void exec_hold (sys_state_t state)
+static void exec_hold (void *data)
 {
     spindle_control(Off);
 
@@ -342,7 +342,7 @@ static void onExecuteRealtime (sys_state_t state)
 
             if(was_stitching) {
                 job.paused = true;
-                protocol_enqueue_rt_command(exec_hold);
+                protocol_enqueue_foreground_task(exec_hold, NULL);
             } else
                 mc_line(job.position.values, &job.plan_data);
             break;
@@ -356,7 +356,7 @@ static void onExecuteRealtime (sys_state_t state)
             job.position.y += stitch->target.y;
             mc_line(job.position.values, &job.plan_data);
 
-            protocol_enqueue_rt_command(exec_thread_trim);
+            protocol_enqueue_foreground_task(exec_thread_trim, NULL);
             break;
 
         case Stitch_Stop:
@@ -368,7 +368,7 @@ static void onExecuteRealtime (sys_state_t state)
 //            mc_line(job.position.values, &job.plan_data);
 
             job.color = stitch->color;
-            protocol_enqueue_rt_command(exec_thread_change);
+            protocol_enqueue_foreground_task(exec_thread_change, NULL);
             job.spindle_stop = embroidery.stop_delay;
             break;
 
@@ -609,7 +609,7 @@ static void embroidery_settings_restore (void)
         if(port > 0) do {
             port--;
             if((portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port))) {
-                if(!portinfo->cap.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling))) {
+                if(!portinfo->mode.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling))) {
                     embroidery.port = port;
                     break;
                 }
@@ -626,16 +626,6 @@ static void embroidery_settings_restore (void)
     embroidery.edge = n_ports ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
 
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&embroidery, sizeof(embroidery_settings_t), true);
-}
-
-static void warning_pin (uint_fast16_t state)
-{
-    report_message("Embroidery plugin failed to initialize, no pin for needle trigger signal!", Message_Warning);
-}
-
-static void warning_mem (uint_fast16_t state)
-{
-    report_message("Embroidery plugin failed to initialize, no NVS storage for settings!", Message_Warning);
 }
 
 static void embroidery_settings_load (void)
@@ -661,10 +651,10 @@ static void embroidery_settings_load (void)
 
         xbar_t *portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port);
 
-        if(portinfo && !portinfo->cap.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
+        if(portinfo && !portinfo->mode.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
             hal.port.register_interrupt_handler(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
         else
-            protocol_enqueue_rt_command(warning_pin);
+            protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no pin for needle trigger signal!");
     }
 }
 
@@ -687,7 +677,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:EMBROIDERY v0.05]" ASCII_EOL);
+        hal.stream.write("[PLUGIN:EMBROIDERY v0.06]" ASCII_EOL);
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
@@ -732,7 +722,7 @@ void embroidery_init (void)
         api.thread_trim = thread_trim;
         api.thread_change = thread_change;
     } else
-        protocol_enqueue_rt_command(warning_mem);
+        protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no NVS storage for settings!");
 }
 
 #endif // EMBROIDERY_ENABLE
