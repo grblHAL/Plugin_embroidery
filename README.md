@@ -18,7 +18,7 @@ The reasons for streaming these formats from SD card instead of first translatin
 In order to support rendering of projects in senders a simple gcode format can be requested from the controller
 with the `$F<(filename)` command where `(filename)` is the name of the file to be rendered. The output is plain
 gcode terminated with `ok`.  
-Note that this output _cannot_ be used to run jobs by streaming them back, `$F(filename)` has to be used!
+Note that this output _cannot_ be used to run jobs by streaming them back, `$F=(filename)` has to be used!
 
 #### Settings:
 
@@ -55,4 +55,4 @@ this may be used for triggering next stitch if gcode translation is to be used.
 #### Credits:
 
 ---
-2023-03-16
+2024-11-14
