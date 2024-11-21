@@ -2,20 +2,22 @@
 
   embroidery.c - plugin for reading and executing embroidery files from SD card.
 
+  Part of grblHAL
+
   Copyright (c) 2023-2024 Terje Io
 
-  Grbl is free software: you can redistribute it and/or modify
+  grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
   (at your option) any later version.
 
-  Grbl is distributed in the hope that it will be useful,
+  grblHAL is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
   GNU General Public License for more programmed.
 
   You should have received a copy of the GNU General Public License
-  along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
+  along with grblHAL. If not, see <http://www.gnu.org/licenses/>.
 
 */
 
@@ -658,26 +660,12 @@ static void embroidery_settings_load (void)
     }
 }
 
-static setting_details_t setting_details = {
-    .groups = embroidery_groups,
-    .n_groups = sizeof(embroidery_groups) / sizeof(setting_group_detail_t),
-    .settings = embroidery_settings,
-    .n_settings = sizeof(embroidery_settings) / sizeof(setting_detail_t),
-#ifndef NO_SETTINGS_DESCRIPTIONS
-    .descriptions = embroidery_settings_descr,
-    .n_descriptions = sizeof(embroidery_settings_descr) / sizeof(setting_descr_t),
-#endif
-    .load = embroidery_settings_load,
-    .restore = embroidery_settings_restore,
-    .save = embroidery_settings_save
-};
-
 static void onReportOptions (bool newopt)
 {
     on_report_options(newopt);
 
     if(!newopt)
-        hal.stream.write("[PLUGIN:EMBROIDERY v0.06]" ASCII_EOL);
+        report_plugin("EMBROIDERY", "0.07");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
@@ -697,10 +685,27 @@ void embroidery_set_thread_change_handler (thread_change_ptr handler)
 
 void embroidery_init (void)
 {
+    static setting_details_t setting_details = {
+        .groups = embroidery_groups,
+        .n_groups = sizeof(embroidery_groups) / sizeof(setting_group_detail_t),
+        .settings = embroidery_settings,
+        .n_settings = sizeof(embroidery_settings) / sizeof(setting_detail_t),
+    #ifndef NO_SETTINGS_DESCRIPTIONS
+        .descriptions = embroidery_settings_descr,
+        .n_descriptions = sizeof(embroidery_settings_descr) / sizeof(setting_descr_t),
+    #endif
+        .load = embroidery_settings_load,
+        .restore = embroidery_settings_restore,
+        .save = embroidery_settings_save
+    };
+
     if((nvs_address = nvs_alloc(sizeof(embroidery_settings_t)))) {
 
         job.completed = true;
         active_stream.type = StreamType_Null;
+
+        n_ports = ioports_available(Port_Digital, Port_Input);
+        strcpy(max_port, uitoa(n_ports - 1));
 
         settings_register(&setting_details);
 
