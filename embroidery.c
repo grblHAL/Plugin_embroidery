@@ -4,7 +4,7 @@
 
   Part of grblHAL
 
-  Copyright (c) 2023-2024 Terje Io
+  Copyright (c) 2023-2025 Terje Io
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -592,6 +592,13 @@ static const setting_descr_t embroidery_settings_descr[] = {
 
 #endif
 
+static bool get_port (xbar_t *properties, uint8_t port, void *data)
+{
+    *(uint8_t *)data = port;
+
+    return true;
+}
+
 static void embroidery_settings_save (void)
 {
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&embroidery, sizeof(embroidery_settings_t), true);
@@ -599,33 +606,16 @@ static void embroidery_settings_save (void)
 
 static void embroidery_settings_restore (void)
 {
-    if(ioport_can_claim_explicit() && (n_ports = ioports_available(Port_Digital, Port_Input))) {
-
-        xbar_t *portinfo;
-        uint8_t port = n_ports;
-
-        embroidery.port = 0;
-        strcpy(max_port, uitoa(n_ports - 1));
-
-        // Find highest numbered port that supports change interrupt.
-        if(port > 0) do {
-            port--;
-            if((portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port))) {
-                if(!portinfo->mode.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling))) {
-                    embroidery.port = port;
-                    break;
-                }
-            }
-        } while(port);
-    } else if((n_ports = hal.port.num_digital_in))
-        embroidery.port = --hal.port.num_digital_in;
+    // Find highest numbered port that supports change interrupt.
+    if(!ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .irq_mode = (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling), .claimable = On }, get_port, (void *)&embroidery.port))
+        embroidery.port = hal.port.num_digital_in ? --hal.port.num_digital_in : 0xFF;
 
     embroidery.feedrate = 4000.0f;
     embroidery.z_travel = 10.0f;
     embroidery.stop_delay = 0;
     embroidery.sync_mode = On;
     embroidery.debug = false;
-    embroidery.edge = n_ports ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
+    embroidery.edge = embroidery.port != 0xFF ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
 
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&embroidery, sizeof(embroidery_settings_t), true);
 }
@@ -651,7 +641,7 @@ static void embroidery_settings_load (void)
 
         port = embroidery.port;
 
-        xbar_t *portinfo = hal.port.get_pin_info(Port_Digital, Port_Input, port);
+        xbar_t *portinfo = ioport_get_info(Port_Digital, Port_Input, port);
 
         if(portinfo && !portinfo->mode.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
             hal.port.register_interrupt_handler(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
@@ -665,7 +655,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("EMBROIDERY", "0.07");
+        report_plugin("EMBROIDERY", "0.08");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
