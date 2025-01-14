@@ -51,7 +51,7 @@ typedef struct {
     bool sync_mode;
     uint16_t stop_delay;
     embroidery_trig_t edge;
-    bool debug;
+    uint8_t debug_port;
 } embroidery_settings_t;
 
 typedef struct {
@@ -91,8 +91,8 @@ typedef struct {
     stitch_queue_t queue;
 } embroidery_job_t;
 
-static uint8_t port, n_ports;
-static char max_port[4];
+static uint8_t port, debug_port, n_din, n_dout;
+static char max_port[4], max_out_port[4];
 static uint32_t nvs_address;
 
 static io_stream_t active_stream;
@@ -212,8 +212,8 @@ static void onStateChanged (sys_state_t state)
 
     job.machine_state = state;
 
-    if(embroidery.debug)
-        hal.port.digital_out(0, state == STATE_CYCLE);
+    if(debug_port != 0xFF)
+        hal.port.digital_out(debug_port, state == STATE_CYCLE);
 
     if(on_state_change)
         on_state_change(state);
@@ -541,22 +541,19 @@ static const setting_group_detail_t embroidery_groups [] = {
     {Group_Root, Group_Embroidery, "Embroidery"}
 };
 
-static bool is_setting_available (const setting_detail_t *setting)
+static bool is_setting_available (const setting_detail_t *setting, uint_fast16_t offset)
 {
     bool ok = false;
 
     switch(setting->id) {
 
         case Setting_UserDefined_2:
-            ok = ioport_can_claim_explicit();
-            break;
-
         case Setting_UserDefined_5:
-            ok = n_ports > 0;
+            ok = n_din > 0;
             break;
 
         case Setting_UserDefined_6:
-            ok = hal.port.num_digital_out > 0;
+            ok = n_dout > 0;
             break;
 
         default:
@@ -566,14 +563,55 @@ static bool is_setting_available (const setting_detail_t *setting)
     return ok;
 }
 
+static status_code_t set_port (setting_id_t setting, float value)
+{
+    status_code_t status;
+
+    if((status = isintf(value) ? Status_OK : Status_BadNumberFormat) == Status_OK)
+      switch(setting) {
+
+        case Setting_UserDefined_2:
+            embroidery.port = value < 0.0f ? 0xFF : (uint8_t)value;
+            break;
+
+        case Setting_UserDefined_6:
+            embroidery.debug_port = value < 0.0f ? 0xFF : (uint8_t)value;
+            break;
+
+        default: break;
+    }
+
+    return status;
+}
+
+static float get_port (setting_id_t setting)
+{
+    float value = -1.0f;
+
+    switch(setting) {
+
+        case Setting_UserDefined_2:
+            value = embroidery.port >= n_din ? -1.0f : (float)embroidery.port;
+            break;
+
+        case Setting_UserDefined_6:
+            value = embroidery.debug_port >= n_dout ? -1.0f : (float)embroidery.debug_port;
+            break;
+
+        default: break;
+    }
+
+    return value;
+}
+
 static const setting_detail_t embroidery_settings[] = {
     { Setting_UserDefined_0, Group_Embroidery, "Embroidery feedrate", "mm/min", Format_Decimal, "####0.0", NULL, NULL, Setting_NonCore, &embroidery.feedrate, NULL, NULL },
     { Setting_UserDefined_1, Group_Embroidery, "Embroidery Z travel", "mm", Format_Decimal, "##0.0", NULL, NULL, Setting_NonCore, &embroidery.z_travel, NULL, NULL },
-    { Setting_UserDefined_2, Group_AuxPorts, "Embroidery trigger port", NULL, Format_Int8, "#0", "0", max_port, Setting_NonCore, &embroidery.port, NULL, is_setting_available, { .reboot_required = On } },
+    { Setting_UserDefined_2, Group_AuxPorts, "Embroidery trigger port", NULL, Format_Decimal, "-#0", "-1", max_port, Setting_NonCoreFn, set_port, get_port, is_setting_available, { .reboot_required = On } },
     { Setting_UserDefined_3, Group_Embroidery, "Embroidery sync mode", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.sync_mode, NULL, NULL },
     { Setting_UserDefined_4, Group_Embroidery, "Embroidery stop delay", "milliseconds", Format_Int16, "##0", NULL, NULL, Setting_NonCore, &embroidery.stop_delay, NULL, NULL },
     { Setting_UserDefined_5, Group_Embroidery, "Trigger edge/input", NULL, Format_RadioButtons, "Falling,Rising,Z limit", NULL, NULL, Setting_NonCore, &embroidery.edge, NULL, NULL, { .reboot_required = On } },
-    { Setting_UserDefined_6, Group_Embroidery, "Debug", NULL, Format_Bool, NULL, NULL, NULL, Setting_NonCore, &embroidery.debug, NULL, is_setting_available },
+    { Setting_UserDefined_6, Group_AuxPorts, "Embroidery debug port", NULL, Format_Decimal, "-#0", "-1", max_out_port, Setting_NonCoreFn, set_port, get_port, is_setting_available, { .reboot_required = On } },
 };
 
 #ifndef NO_SETTINGS_DESCRIPTIONS
@@ -581,23 +619,16 @@ static const setting_detail_t embroidery_settings[] = {
 static const setting_descr_t embroidery_settings_descr[] = {
     { Setting_UserDefined_0, "Feedrate to be used when embroidering." },
     { Setting_UserDefined_1, "Z travel per stitch when needle is controlled by a stepper (sync mode = 0)." },
-    { Setting_UserDefined_2, "Aux input port to use for needle trigger (sync mode = 1, trigger edge <> Z limit input)." },
+    { Setting_UserDefined_2, "Aux input port to use for needle trigger (sync mode = 1, trigger edge <> Z limit input). Set to -1 to disable." },
     { Setting_UserDefined_3, "When sync mode is enabled XY motion is controlled by needle trigger, else the Z axis stepper runs the needle motor." },
     { Setting_UserDefined_4, "Delay after last needle trigger before stopping needle motor (sync mode = 1)." },
     { Setting_UserDefined_5, "Trigger edge for needle trigger, from aux input or Z limit input (sync mode = 1).\\n\\n"
                              "NOTE: When Z limit input is used hard limits has to be enabled!"
     },
-    { Setting_UserDefined_6, "Debug mode, outputs high on aux port when XY motion is ongoing." }
+    { Setting_UserDefined_6, "Debug port, outputs high on aux port when XY motion is ongoing. Set to -1 to disable." }
 };
 
 #endif
-
-static bool get_port (xbar_t *properties, uint8_t port, void *data)
-{
-    *(uint8_t *)data = port;
-
-    return true;
-}
 
 static void embroidery_settings_save (void)
 {
@@ -606,15 +637,12 @@ static void embroidery_settings_save (void)
 
 static void embroidery_settings_restore (void)
 {
-    // Find highest numbered port that supports change interrupt.
-    if(!ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .irq_mode = (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling), .claimable = On }, get_port, (void *)&embroidery.port))
-        embroidery.port = hal.port.num_digital_in ? --hal.port.num_digital_in : 0xFF;
-
     embroidery.feedrate = 4000.0f;
     embroidery.z_travel = 10.0f;
     embroidery.stop_delay = 0;
     embroidery.sync_mode = On;
-    embroidery.debug = false;
+    embroidery.debug_port = 0xFF;
+    embroidery.port = ioport_find_free(Port_Digital, Port_Input, (pin_cap_t){ .irq_mode = (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling), .claimable = On }, "Embroidery needle trigger");
     embroidery.edge = embroidery.port != 0xFF ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
 
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&embroidery, sizeof(embroidery_settings_t), true);
@@ -625,8 +653,10 @@ static void embroidery_settings_load (void)
     if(hal.nvs.memcpy_from_nvs((uint8_t *)&embroidery, nvs_address, sizeof(embroidery_settings_t), true) != NVS_TransferResult_OK)
         embroidery_settings_restore();
 
-    if(embroidery.debug)
-        embroidery.debug = hal.port.num_digital_out > 0;
+    if(embroidery.port >= n_din)
+        embroidery.port = 0xFF;
+    if(embroidery.debug_port >= n_dout)
+        embroidery.debug_port = 0xFF;
 
     if(embroidery.edge == EmbroideryTrig_ZLimit) {
 
@@ -634,12 +664,9 @@ static void embroidery_settings_load (void)
 
         limits_interrupt_callback = hal.limits.interrupt_callback;
         hal.limits.interrupt_callback = z_limit_trigger;
-
         // ensure hard limits is enabled - interrupt will not fire if not
 
-    } else {
-
-        port = embroidery.port;
+    } else if((port = embroidery.port) != 0xFF) {
 
         xbar_t *portinfo = ioport_get_info(Port_Digital, Port_Input, port);
 
@@ -648,6 +675,11 @@ static void embroidery_settings_load (void)
         else
             protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no pin for needle trigger signal!");
     }
+
+    if((debug_port = embroidery.debug_port) != 0xFF) {
+        if(!ioport_claim(Port_Digital, Port_Output, &debug_port, "Embroidery debug output"))
+            debug_port = 0xFF;
+    }
 }
 
 static void onReportOptions (bool newopt)
@@ -655,7 +687,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("EMBROIDERY", "0.08");
+        report_plugin("EMBROIDERY", "0.09");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
@@ -694,8 +726,11 @@ void embroidery_init (void)
         job.completed = true;
         active_stream.type = StreamType_Null;
 
-        n_ports = ioports_available(Port_Digital, Port_Input);
-        strcpy(max_port, uitoa(n_ports - 1));
+        n_din = ioports_available(Port_Digital, Port_Input);
+        strcpy(max_port, uitoa(n_din - 1));
+
+        n_dout = ioports_available(Port_Digital, Port_Output);
+        strcpy(max_out_port, uitoa(n_dout - 1));
 
         settings_register(&setting_details);
 
