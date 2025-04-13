@@ -25,10 +25,15 @@
 
 #if EMBROIDERY_ENABLE
 
-#if !SDCARD_ENABLE
+#ifndef IOPORT_UNASSIGNED
+#define IOPORT_UNASSIGNED 255
+#endif
+
+#if !(FS_ENABLE & FS_SDCARD)
 #error "Embroidery plugin requires SD card plugin enabled!"
 #endif
 
+#include "grbl/task.h"
 #include "grbl/motion_control.h"
 #include "grbl/protocol.h"
 #include "grbl/nvs_buffer.h"
@@ -52,6 +57,8 @@ typedef struct {
     uint16_t stop_delay;
     embroidery_trig_t edge;
     uint8_t debug_port;
+    uint8_t break_port;
+    uint8_t jump_port;
 } embroidery_settings_t;
 
 typedef struct {
@@ -68,19 +75,28 @@ typedef struct {
     uint32_t sequin_ejects;
 } embroidery_job_details_t;
 
+typedef union {
+    uint32_t value;
+    struct {
+        uint32_t pause   :1,
+                 trigger :1,
+                 jump    :1;
+    };
+} embroidery_await_t;
+
 typedef struct {
     bool enqueued;
     bool completed;
     bool paused;
     bool stitching;
     bool first;
-    volatile bool await_trigger;
+    volatile embroidery_await_t await;
     uint32_t trigger_interval, trigger_interval_min;
     uint32_t last_trigger;
     uint32_t stitch_interval;
     embroidery_job_details_t programmed;
     embroidery_job_details_t executed;
-    uint32_t errs, exced;
+    uint32_t errs, exced, breaks;
     uint32_t spindle_stop;
     spindle_state_t spindle;
     volatile sys_state_t machine_state;
@@ -91,7 +107,7 @@ typedef struct {
     stitch_queue_t queue;
 } embroidery_job_t;
 
-static uint8_t port, debug_port, n_din, n_dout;
+static uint8_t port, break_port, jump_port, debug_port, n_din, n_dout;
 static char max_port[4], max_out_port[4];
 static uint32_t nvs_address;
 
@@ -149,6 +165,14 @@ static void thread_change (embroidery_thread_color_t color)
     job.executed.thread_changes++;
 }
 
+static void jump_out (bool on)
+{
+    if(jump_port == IOPORT_UNASSIGNED)
+        hal.coolant.set_state((coolant_state_t){ .mist = on });
+    else
+        ioport_digital_out(jump_port, on);
+}
+
 static void exec_thread_change (void *data)
 {
     api.thread_change(job.color);
@@ -175,7 +199,7 @@ static void exec_hold (void *data)
 {
     spindle_control(Off);
 
-    report_message("Jump", Message_Info);
+    report_message((char *)data, Message_Info);
     protocol_buffer_synchronize();              // Sync and finish all remaining buffered motions before moving on.
     system_set_exec_state_flag(EXEC_FEED_HOLD); // Use feed hold for program pause.
     protocol_execute_realtime();                // Execute suspend.
@@ -192,7 +216,11 @@ static void onStateChanged (sys_state_t state)
     switch(state) {
 
         case STATE_IDLE:
-            if(job.stitching && job.machine_state == STATE_CYCLE) {
+            if(job.await.jump) {
+                jump_out(false);
+                job.await.jump = false;
+            }
+            else if(job.stitching && job.machine_state == STATE_CYCLE) {
 //                if(job.first)
 //                    job.first = false;
  //               else {
@@ -208,12 +236,12 @@ static void onStateChanged (sys_state_t state)
     }
 
     if(job.machine_state == STATE_HOLD)
-        job.paused = false;
+        job.await.pause = false;
 
     job.machine_state = state;
 
-    if(debug_port != 0xFF)
-        hal.port.digital_out(debug_port, state == STATE_CYCLE);
+    if(debug_port != IOPORT_UNASSIGNED)
+        ioport_digital_out(debug_port, state == STATE_CYCLE);
 
     if(on_state_change)
         on_state_change(state);
@@ -223,7 +251,7 @@ static inline void set_needle_trigger (void)
 {
     uint32_t ms = hal.get_elapsed_ticks();
 
-    if(job.await_trigger /*&& ms - job.last_trigger > 25*/) {
+    if(job.await.trigger /*&& ms - job.last_trigger > 25*/) {
 
         job.trigger_interval = ms - job.last_trigger;
         job.trigger_interval_min = min(job.trigger_interval_min, job.trigger_interval);
@@ -233,7 +261,7 @@ static inline void set_needle_trigger (void)
             return;
         }
 
-        job.await_trigger = false;
+        job.await.trigger = false;
     }
 
     job.executed.stitches++;
@@ -256,6 +284,15 @@ ISR_CODE static void ISR_FUNC(needle_trigger)(uint8_t port, bool state)
     set_needle_trigger();
 }
 
+ISR_CODE static void ISR_FUNC(thread_break)(uint8_t port, bool state)
+{
+    if(job.file && !job.await.pause) {
+        job.breaks++;
+        if(job.executed.stitches > job.breaks + 10)
+            task_add_immediate(exec_hold, "Thread break!");
+    }
+}
+
 static void onExecuteRealtime (sys_state_t state)
 {
     static bool busy = false;
@@ -270,7 +307,7 @@ static void onExecuteRealtime (sys_state_t state)
         job.spindle_stop = 0;
     }
 
-    if(job.paused || job.await_trigger)
+    if(job.await.value)
         return;
 
     if(job.enqueued && job.queue.tail == job.queue.head) {
@@ -303,8 +340,12 @@ static void onExecuteRealtime (sys_state_t state)
 
     // If stitching look-ahead to next command to see if we should stop the motor early to avoid overshoot.
     if(job.stitching) {
-        if(job.queue.tail != job.queue.head && job.queue.stitch[job.queue.tail].type != Stitch_Normal && embroidery.stop_delay)
-            job.spindle_stop = embroidery.stop_delay;
+        if(job.queue.tail != job.queue.head && job.queue.stitch[job.queue.tail].type != Stitch_Normal) {
+            if(job.queue.stitch[job.queue.tail].type == Stitch_Jump)
+                jump_out(true);
+            else if(embroidery.stop_delay)
+                job.spindle_stop = embroidery.stop_delay;
+        }
     }
 
     if(!(job.stitching = stitch->type == Stitch_Normal) && embroidery.stop_delay == 0) {
@@ -326,7 +367,7 @@ static void onExecuteRealtime (sys_state_t state)
 
             mc_line(job.position.values, &job.plan_data);
 
-            if(!(job.await_trigger = embroidery.sync_mode)) {
+            if(!(job.await.trigger = embroidery.sync_mode)) {
 //                plan_data.condition.rapid_motion = On;
                 job.position.z = -embroidery.z_travel;
                 mc_line(job.position.values, &job.plan_data);
@@ -342,15 +383,15 @@ static void onExecuteRealtime (sys_state_t state)
             job.position.x += stitch->target.x;
             job.position.y += stitch->target.y;
 
-            if(was_stitching) {
-                job.paused = true;
-                protocol_enqueue_foreground_task(exec_hold, NULL);
-            } else
-                mc_line(job.position.values, &job.plan_data);
+//            if(was_stitching) {
+//                job.await.pause = true;
+//                task_add_immediate(exec_hold, "Jump");
+//            } else
+                job.await.jump = mc_line(job.position.values, &job.plan_data);
             break;
 
         case Stitch_Trim:
-            job.paused = true;
+            job.await.pause = true;
             job.plan_data.condition.rapid_motion = On;
             job.spindle_stop = embroidery.stop_delay;
 
@@ -358,11 +399,11 @@ static void onExecuteRealtime (sys_state_t state)
             job.position.y += stitch->target.y;
             mc_line(job.position.values, &job.plan_data);
 
-            protocol_enqueue_foreground_task(exec_thread_trim, NULL);
+            task_add_immediate(exec_thread_trim, NULL);
             break;
 
         case Stitch_Stop:
-            job.paused = true;
+            job.await.pause = true;
             job.plan_data.condition.rapid_motion = On;
 
             job.position.x += stitch->target.x;
@@ -370,7 +411,7 @@ static void onExecuteRealtime (sys_state_t state)
 //            mc_line(job.position.values, &job.plan_data);
 
             job.color = stitch->color;
-            protocol_enqueue_foreground_task(exec_thread_change, NULL);
+            task_add_immediate(exec_thread_change, NULL);
             job.spindle_stop = embroidery.stop_delay;
             break;
 
@@ -448,32 +489,38 @@ static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool strea
 {
     bool ok = false;
 
+
     if(brother_open_file(file, &api) || tajima_open_file(file, &api)) {
 
         if(stream) {
 
-            memcpy(&active_stream, &hal.stream, sizeof(io_stream_t));   // Save current stream pointers
-            hal.stream.type = StreamType_File;                          // then redirect to read from SD card instead
-            hal.stream.read = sdcard_read;                              // ...
+            if(break_port == IOPORT_UNASSIGNED || ioport_wait_on_input(true, break_port, WaitMode_Immediate, 0.0f) == 0) {
 
-            plan_data_init(&job.plan_data);
+                memcpy(&active_stream, &hal.stream, sizeof(io_stream_t));   // Save current stream pointers
+                hal.stream.type = StreamType_File;                          // then redirect to read from SD card instead
+                hal.stream.read = sdcard_read;                              // ...
 
-            job.file = file;
-            job.completed = job.enqueued = job.await_trigger = job.paused = job.stitching = false;
-            job.queue.head = job.queue.tail = job.stitch_interval = job.trigger_interval = 0;
-            job.plan_data.feed_rate = embroidery.feedrate;
-            job.plan_data.condition.rapid_motion = On;
-            if(embroidery.sync_mode)
-                job.plan_data.spindle.hal->get_data = spindleGetData;
-            job.plan_data.spindle.hal->cap.at_speed = On,
-            system_convert_array_steps_to_mpos(job.position.values, sys.position);
+                plan_data_init(&job.plan_data);
 
-            memset(&job.programmed, 0, sizeof(embroidery_job_details_t));
-            memset(&job.executed, 0, sizeof(embroidery_job_details_t));
+                job.file = file;
+                job.completed = job.enqueued = job.stitching = false;
+                job.queue.head = job.queue.tail = job.stitch_interval = job.trigger_interval = job.await.value = job.breaks = 0;
+                job.plan_data.feed_rate = embroidery.feedrate;
+                job.plan_data.condition.rapid_motion = On;
+                if(embroidery.sync_mode)
+                    job.plan_data.spindle.hal->get_data = spindleGetData;
+                job.plan_data.spindle.hal->cap.at_speed = On,
+                system_convert_array_steps_to_mpos(job.position.values, sys.position);
 
-            job.trigger_interval_min = 10000;
-            job.errs = job.exced = 0;
+                memset(&job.programmed, 0, sizeof(embroidery_job_details_t));
+                memset(&job.executed, 0, sizeof(embroidery_job_details_t));
 
+                job.trigger_interval_min = 10000;
+                job.errs = job.exced = 0;
+            } else {
+                vfs_close(file);
+                report_message("No thread detected", Message_Error);
+            }
         } else {
 
             bool no_move = false;
@@ -538,7 +585,7 @@ static void sdcard_reset (void)
 }
 
 static const setting_group_detail_t embroidery_groups [] = {
-    {Group_Root, Group_Embroidery, "Embroidery"}
+    { Group_Root, Group_Embroidery, "Embroidery" }
 };
 
 static bool is_setting_available (const setting_detail_t *setting, uint_fast16_t offset)
@@ -549,10 +596,12 @@ static bool is_setting_available (const setting_detail_t *setting, uint_fast16_t
 
         case Setting_UserDefined_2:
         case Setting_UserDefined_5:
+        case Setting_UserDefined_7:
             ok = n_din > 0;
             break;
 
         case Setting_UserDefined_6:
+        case Setting_UserDefined_8:
             ok = n_dout > 0;
             break;
 
@@ -571,11 +620,19 @@ static status_code_t set_port (setting_id_t setting, float value)
       switch(setting) {
 
         case Setting_UserDefined_2:
-            embroidery.port = value < 0.0f ? 0xFF : (uint8_t)value;
+            embroidery.port = value < 0.0f ? IOPORT_UNASSIGNED : (uint8_t)value;
             break;
 
         case Setting_UserDefined_6:
-            embroidery.debug_port = value < 0.0f ? 0xFF : (uint8_t)value;
+            embroidery.debug_port = value < 0.0f ? IOPORT_UNASSIGNED : (uint8_t)value;
+            break;
+
+        case Setting_UserDefined_7:
+            embroidery.break_port = value < 0.0f ? IOPORT_UNASSIGNED : (uint8_t)value;
+            break;
+
+        case Setting_UserDefined_8:
+            embroidery.jump_port = value < 0.0f ? IOPORT_UNASSIGNED : (uint8_t)value;
             break;
 
         default: break;
@@ -598,6 +655,14 @@ static float get_port (setting_id_t setting)
             value = embroidery.debug_port >= n_dout ? -1.0f : (float)embroidery.debug_port;
             break;
 
+        case Setting_UserDefined_7:
+            value = embroidery.break_port >= n_din ? -1.0f : (float)embroidery.break_port;
+            break;
+
+        case Setting_UserDefined_8:
+            value = embroidery.jump_port >= n_din ? -1.0f : (float)embroidery.jump_port;
+            break;
+
         default: break;
     }
 
@@ -612,6 +677,8 @@ static const setting_detail_t embroidery_settings[] = {
     { Setting_UserDefined_4, Group_Embroidery, "Embroidery stop delay", "milliseconds", Format_Int16, "##0", NULL, NULL, Setting_NonCore, &embroidery.stop_delay, NULL, NULL },
     { Setting_UserDefined_5, Group_Embroidery, "Trigger edge/input", NULL, Format_RadioButtons, "Falling,Rising,Z limit", NULL, NULL, Setting_NonCore, &embroidery.edge, NULL, NULL, { .reboot_required = On } },
     { Setting_UserDefined_6, Group_AuxPorts, "Embroidery debug port", NULL, Format_Decimal, "-#0", "-1", max_out_port, Setting_NonCoreFn, set_port, get_port, is_setting_available, { .reboot_required = On } },
+    { Setting_UserDefined_7, Group_AuxPorts, "Thread break port", NULL, Format_Decimal, "-#0", "-1", max_port, Setting_NonCoreFn, set_port, get_port, is_setting_available, { .reboot_required = On } },
+    { Setting_UserDefined_8, Group_AuxPorts, "Jump port", NULL, Format_Decimal, "-#0", "-1", max_port, Setting_NonCoreFn, set_port, get_port, is_setting_available, { .reboot_required = On } }
 };
 
 #ifndef NO_SETTINGS_DESCRIPTIONS
@@ -625,7 +692,9 @@ static const setting_descr_t embroidery_settings_descr[] = {
     { Setting_UserDefined_5, "Trigger edge for needle trigger, from aux input or Z limit input (sync mode = 1).\\n\\n"
                              "NOTE: When Z limit input is used hard limits has to be enabled!"
     },
-    { Setting_UserDefined_6, "Debug port, outputs high on aux port when XY motion is ongoing. Set to -1 to disable." }
+    { Setting_UserDefined_6, "Debug port, outputs high on aux port when XY motion is ongoing. Set to -1 to disable." },
+    { Setting_UserDefined_7, "Thread break detection port. Set to -1 to disable." },
+    { Setting_UserDefined_8, "Jump output port. Set to -1 to disable." }
 };
 
 #endif
@@ -641,24 +710,35 @@ static void embroidery_settings_restore (void)
     embroidery.z_travel = 10.0f;
     embroidery.stop_delay = 0;
     embroidery.sync_mode = On;
-    embroidery.debug_port = 0xFF;
+    embroidery.break_port =
+    embroidery.jump_port =
+    embroidery.debug_port = IOPORT_UNASSIGNED;
     embroidery.port = ioport_find_free(Port_Digital, Port_Input, (pin_cap_t){ .irq_mode = (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling), .claimable = On }, "Embroidery needle trigger");
-    embroidery.edge = embroidery.port != 0xFF ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
+    embroidery.edge = embroidery.port != IOPORT_UNASSIGNED ? EmbroideryTrig_Falling : EmbroideryTrig_ZLimit;
 
     hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&embroidery, sizeof(embroidery_settings_t), true);
 }
 
 static void embroidery_settings_load (void)
 {
+    bool ok;
+
     if(hal.nvs.memcpy_from_nvs((uint8_t *)&embroidery, nvs_address, sizeof(embroidery_settings_t), true) != NVS_TransferResult_OK)
         embroidery_settings_restore();
 
     if(embroidery.port >= n_din)
-        embroidery.port = 0xFF;
-    if(embroidery.debug_port >= n_dout)
-        embroidery.debug_port = 0xFF;
+        embroidery.port = IOPORT_UNASSIGNED;
 
-    if(embroidery.edge == EmbroideryTrig_ZLimit) {
+    if(embroidery.break_port >= n_din)
+        embroidery.break_port = IOPORT_UNASSIGNED;
+
+    if(embroidery.debug_port >= n_dout)
+        embroidery.debug_port = IOPORT_UNASSIGNED;
+
+    if(embroidery.jump_port >= n_dout)
+        embroidery.jump_port = IOPORT_UNASSIGNED;
+
+    if((ok = embroidery.edge == EmbroideryTrig_ZLimit)) {
 
         hal.driver_cap.software_debounce = Off;
 
@@ -666,20 +746,38 @@ static void embroidery_settings_load (void)
         hal.limits.interrupt_callback = z_limit_trigger;
         // ensure hard limits is enabled - interrupt will not fire if not
 
-    } else if((port = embroidery.port) != 0xFF) {
+    } else if((port = embroidery.port) != IOPORT_UNASSIGNED) {
 
         xbar_t *portinfo = ioport_get_info(Port_Digital, Port_Input, port);
 
         if(portinfo && !portinfo->mode.claimed && (portinfo->cap.irq_mode & (embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &port, "Embroidery needle trigger"))
-            hal.port.register_interrupt_handler(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
-        else
-            protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no pin for needle trigger signal!");
+            ok = ioport_enable_irq(port, embroidery.edge ? IRQ_Mode_Rising : IRQ_Mode_Falling, needle_trigger);
     }
 
-    if((debug_port = embroidery.debug_port) != 0xFF) {
-        if(!ioport_claim(Port_Digital, Port_Output, &debug_port, "Embroidery debug output"))
-            debug_port = 0xFF;
-    }
+    if(ok) {
+        if((break_port = embroidery.break_port) != IOPORT_UNASSIGNED) {
+
+            xbar_t *portinfo = ioport_get_info(Port_Digital, Port_Input, break_port);
+
+            if(portinfo && !portinfo->mode.claimed && (portinfo->cap.irq_mode & (portinfo->mode.inverted ? IRQ_Mode_Rising : IRQ_Mode_Falling)) && ioport_claim(Port_Digital, Port_Input, &break_port, "Embroidery thread break"))
+                ioport_enable_irq(break_port, portinfo->mode.inverted ? IRQ_Mode_Rising : IRQ_Mode_Falling, thread_break);
+            else {
+                break_port = IOPORT_UNASSIGNED;
+                protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to claim port for thread break detection!");
+            }
+        }
+
+        if((jump_port = embroidery.jump_port) != IOPORT_UNASSIGNED) {
+            if(!ioport_claim(Port_Digital, Port_Output, &jump_port, "Embroidery jump output"))
+                jump_port = IOPORT_UNASSIGNED;
+        }
+
+        if((debug_port = embroidery.debug_port) != IOPORT_UNASSIGNED) {
+            if(!ioport_claim(Port_Digital, Port_Output, &debug_port, "Embroidery debug output"))
+                debug_port = IOPORT_UNASSIGNED;
+        }
+    } else
+        protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no pin for needle trigger signal!");
 }
 
 static void onReportOptions (bool newopt)
@@ -687,7 +785,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("EMBROIDERY", "0.09");
+        report_plugin("EMBROIDERY", "0.11");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
