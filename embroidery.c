@@ -763,7 +763,7 @@ static void embroidery_settings_load (void)
                 ioport_enable_irq(break_port, portinfo->mode.inverted ? IRQ_Mode_Rising : IRQ_Mode_Falling, thread_break);
             else {
                 break_port = IOPORT_UNASSIGNED;
-                protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to claim port for thread break detection!");
+                task_run_on_startup(report_warning, "Embroidery plugin failed to claim port for thread break detection!");
             }
         }
 
@@ -777,7 +777,7 @@ static void embroidery_settings_load (void)
                 debug_port = IOPORT_UNASSIGNED;
         }
     } else
-        protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no pin for needle trigger signal!");
+        task_run_on_startup(report_warning, "Embroidery plugin failed to initialize, no pin for needle trigger signal!");
 }
 
 static void onReportOptions (bool newopt)
@@ -785,7 +785,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("EMBROIDERY", "0.11");
+        report_plugin("EMBROIDERY", "0.12");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
@@ -850,7 +850,7 @@ void embroidery_init (void)
         api.thread_trim = thread_trim;
         api.thread_change = thread_change;
     } else
-        protocol_enqueue_foreground_task(report_warning, "Embroidery plugin failed to initialize, no NVS storage for settings!");
+        task_run_on_startup(report_warning, "Embroidery plugin failed to initialize, no NVS storage for settings!");
 }
 
 #endif // EMBROIDERY_ENABLE
