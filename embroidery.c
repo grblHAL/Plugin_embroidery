@@ -387,7 +387,7 @@ static void onExecuteRealtime (sys_state_t state)
 //                job.await.pause = true;
 //                task_add_immediate(exec_hold, "Jump");
 //            } else
-                job.await.jump = mc_line(job.position.values, &job.plan_data);
+                job.await.jump = (stitch->target.x != 0.0f || stitch->target.y != 0.0f) && mc_line(job.position.values, &job.plan_data);
             break;
 
         case Stitch_Trim:
@@ -785,7 +785,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("EMBROIDERY", "0.12");
+        report_plugin("EMBROIDERY", "0.13");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
