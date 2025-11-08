@@ -423,7 +423,7 @@ static void onExecuteRealtime (sys_state_t state)
     busy = false;
 }
 
-static int16_t sdcard_read (void)
+static int32_t sdcard_read (void)
 {
     if(!job.enqueued) {
 
