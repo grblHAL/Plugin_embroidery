@@ -4,7 +4,7 @@
 
   Part of grblHAL
 
-  Copyright (c) 2023-2025 Terje Io
+  Copyright (c) 2023-2026 Terje Io
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -497,8 +497,7 @@ static status_code_t onFileOpen (const char *fname, vfs_file_t *file, bool strea
             if(break_port == IOPORT_UNASSIGNED || ioport_wait_on_input(true, break_port, WaitMode_Immediate, 0.0f) == 0) {
 
                 memcpy(&active_stream, &hal.stream, sizeof(io_stream_t));   // Save current stream pointers
-                hal.stream.type = StreamType_File;                          // then redirect to read from SD card instead
-                hal.stream.read = sdcard_read;                              // ...
+                stream_set_file(file, sdcard_read);                         // then redirect to read from SD card instead
 
                 plan_data_init(&job.plan_data);
 
@@ -772,7 +771,7 @@ static void onReportOptions (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("EMBROIDERY", "0.14");
+        report_plugin("EMBROIDERY", "0.15");
 }
 
 const char *embroidery_get_thread_color (embroidery_thread_color_t color)
